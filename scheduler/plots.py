@@ -1,94 +1,241 @@
 from __future__ import annotations
+
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def plot_illustrative_bars(df_raw: pd.DataFrame, outdir: str):
-    # pick one illustrative setting
-    sub = df_raw[(df_raw["I"] == 2) & (df_raw["J"] == df_raw["J"].min()) & (df_raw["seed"] == 0)]
+def _save(fig, outdir: str, name: str):
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, name)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+def plot_illustrative_bars_with_ci(df_raw: pd.DataFrame, df_agg: pd.DataFrame, outdir: str):
+    # choose smallest I,J for a clean illustrative plot
+    ij = df_raw[["I", "J"]].drop_duplicates().sort_values(["I", "J"]).iloc[0]
+    I, J = int(ij.I), int(ij.J)
+
+    # use aggregated means and ci for baseline_cost vs dro
+    sub = df_agg[(df_agg["I"] == I) & (df_agg["J"] == J) & (df_agg["method"].isin(["baseline_cost", "dro"]))].copy()
     if len(sub) == 0:
         return
 
-    methods = ["baseline_cost", "dro"]
-    sub = sub[sub["method"].isin(methods)].copy()
+    metrics = [
+        ("exp_cost", "Expected Cost"),
+        ("exp_carbon", "Expected Carbon"),
+        ("cvar_carbon", "CVaR 0.9 Carbon"),
+    ]
 
-    metrics = ["exp_cost", "exp_carbon", "cvar_carbon"]
-    labels = ["Expected Cost", "Expected Carbon", "CVaR0.9 Carbon"]
-
+    labels = ["baseline_cost", "dro"]
     x = np.arange(len(metrics))
     width = 0.35
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for i, m in enumerate(methods):
-        row = sub[sub["method"] == m]
-        if len(row) == 0:
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(111)
+
+    for idx, method in enumerate(labels):
+        mrow = sub[sub["method"] == method]
+        if len(mrow) == 0:
             continue
-        vals = [float(row[k].iloc[0]) for k in metrics]
-        ax.bar(x + (i - 0.5) * width, vals, width, label=m)
 
-    ax.set_title("Illustrative comparison (I=2, one seed)")
+        vals = []
+        errs = []
+        for m, _ in metrics:
+            vals.append(float(mrow[f"{m}_mean"].iloc[0]))
+            errs.append(float(mrow[f"{m}_ci95"].iloc[0]))
+
+        ax.bar(x + (idx - 0.5) * width, vals, width, yerr=errs, capsize=4, label=method)
+
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=0)
-    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticklabels([t for _, t in metrics])
+    ax.set_title(f"Illustrative comparison (I={I}, J={J}, mean and 95% CI over seeds)")
+    ax.set_ylabel("Metric value")
     ax.legend()
-    fig.tight_layout()
 
-    path = os.path.join(outdir, "fig_illustrative_bar.png")
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
+    _save(fig, outdir, "fig_illustrative_ci.png")
 
 
-def plot_scaling_lines(df_agg: pd.DataFrame, outdir: str):
-    # expects metrics_agg style columns
-    # plot CVaR carbon mean vs job count for I=2 and I=4
-    if "cvar_carbon_mean" not in df_agg.columns:
-        return
+def plot_scaling_cvar_with_ci(df_agg: pd.DataFrame, outdir: str):
+    # lines of CVaR carbon vs job count, with CI whiskers if available
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for I in sorted(df_agg["I"].unique()):
-        for method in ["baseline_cost", "dro"]:
+    methods = ["baseline_cost", "dro"]
+    for I in sorted(df_agg["I"].dropna().unique()):
+        for method in methods:
             sub = df_agg[(df_agg["I"] == I) & (df_agg["method"] == method)].sort_values("J")
             if len(sub) == 0:
                 continue
-            ax.plot(sub["J"], sub["cvar_carbon_mean"], marker="o", label=f"I={I}, {method}")
+            ax.errorbar(
+                sub["J"].values,
+                sub["cvar_carbon_mean"].values,
+                yerr=sub["cvar_carbon_ci95"].values,
+                marker="o",
+                linestyle="-",
+                capsize=3,
+                label=f"I={int(I)}, {method}",
+            )
 
-    ax.set_title("Scaling behavior: CVaR0.9(carbon) vs job count")
+    ax.set_title("Scaling behavior: CVaR 0.9 carbon vs job count (mean and 95% CI)")
     ax.set_xlabel("Number of jobs (J)")
-    ax.set_ylabel("CVaR0.9 carbon (kg)")
+    ax.set_ylabel("CVaR 0.9 carbon")
     ax.grid(True, alpha=0.3)
     ax.legend(ncol=2)
-    fig.tight_layout()
 
-    path = os.path.join(outdir, "fig_scaling_lines.png")
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
+    _save(fig, outdir, "fig_scaling_cvar_ci.png")
 
 
-def plot_sensitivity_heatmap(df_raw: pd.DataFrame, outdir: str):
-    # Only if those columns exist (optional)
-    # If you later add sweeps over cfg.cvar_w and cfg.eps, wire them into df_raw and this will work.
-    if "cvar_w" not in df_raw.columns or "eps" not in df_raw.columns:
-        return
+def plot_cost_overhead_pct(df_agg: pd.DataFrame, outdir: str):
+    # percent overhead of DRO cost relative to baseline_cost
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
 
-    sub = df_raw[df_raw["method"] == "dro"].copy()
+    for I in sorted(df_agg["I"].dropna().unique()):
+        b = df_agg[(df_agg["I"] == I) & (df_agg["method"] == "baseline_cost")].sort_values("J")
+        d = df_agg[(df_agg["I"] == I) & (df_agg["method"] == "dro")].sort_values("J")
+        if len(b) == 0 or len(d) == 0:
+            continue
+        m = b.merge(d, on=["I", "J"], suffixes=("_b", "_d"))
+        pct = 100.0 * (m["exp_cost_mean_d"] - m["exp_cost_mean_b"]) / m["exp_cost_mean_b"]
+        ax.plot(m["J"], pct, marker="o", label=f"I={int(I)}")
+
+    ax.set_title("Cost overhead of DRO relative to baseline cost only")
+    ax.set_xlabel("Number of jobs (J)")
+    ax.set_ylabel("Cost overhead percent")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    _save(fig, outdir, "fig_cost_overhead_pct.png")
+
+
+def plot_cvar_reduction_pct(df_agg: pd.DataFrame, outdir: str):
+    # percent reduction in CVaR carbon relative to baseline_cost
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+
+    for I in sorted(df_agg["I"].dropna().unique()):
+        b = df_agg[(df_agg["I"] == I) & (df_agg["method"] == "baseline_cost")].sort_values("J")
+        d = df_agg[(df_agg["I"] == I) & (df_agg["method"] == "dro")].sort_values("J")
+        if len(b) == 0 or len(d) == 0:
+            continue
+        m = b.merge(d, on=["I", "J"], suffixes=("_b", "_d"))
+        pct = 100.0 * (m["cvar_carbon_mean_b"] - m["cvar_carbon_mean_d"]) / m["cvar_carbon_mean_b"]
+        ax.plot(m["J"], pct, marker="o", label=f"I={int(I)}")
+
+    ax.set_title("CVaR 0.9 carbon reduction of DRO relative to baseline cost only")
+    ax.set_xlabel("Number of jobs (J)")
+    ax.set_ylabel("CVaR reduction percent")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    _save(fig, outdir, "fig_cvar_reduction_pct.png")
+
+
+def plot_tradeoff_scatter(df_raw: pd.DataFrame, outdir: str):
+    # scatter cost vs cvar carbon for dro vs baseline cost
+    sub = df_raw[df_raw["method"].isin(["baseline_cost", "dro"])].copy()
+    sub = sub[sub["solve_status"].astype(str).str.startswith("ok")]
+
     if len(sub) == 0:
         return
 
-    piv = sub.pivot_table(index="eps", columns="cvar_w", values="cvar_carbon", aggfunc="mean")
-    fig, ax = plt.subplots(figsize=(7, 5))
-    im = ax.imshow(piv.values, aspect="auto", origin="lower")
-    ax.set_xticks(np.arange(piv.shape[1]))
-    ax.set_xticklabels([str(c) for c in piv.columns])
-    ax.set_yticks(np.arange(piv.shape[0]))
-    ax.set_yticklabels([str(r) for r in piv.index])
-    ax.set_xlabel("CVaR weight")
-    ax.set_ylabel("eps (DRCC tolerance)")
-    ax.set_title("Sensitivity: DRO carbon CVaR")
-    fig.colorbar(im, ax=ax)
-    fig.tight_layout()
+    fig = plt.figure(figsize=(7, 5))
+    ax = fig.add_subplot(111)
 
-    path = os.path.join(outdir, "fig_sensitivity.png")
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
+    for method in ["baseline_cost", "dro"]:
+        m = sub[sub["method"] == method]
+        ax.scatter(m["exp_cost"], m["cvar_carbon"], label=method, alpha=0.7)
+
+    ax.set_title("Empirical tradeoff: expected cost vs CVaR 0.9 carbon")
+    ax.set_xlabel("Expected cost")
+    ax.set_ylabel("CVaR 0.9 carbon")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    _save(fig, outdir, "fig_tradeoff_scatter.png")
+
+
+def plot_runtime_scaling(df_raw: pd.DataFrame, outdir: str, tag: str = "scaling"):
+    # runtime vs J, show dro and baselines
+    ok = df_raw.copy()
+    ok = ok[ok["solve_status"].astype(str).str.startswith("ok")]
+
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+
+    for method in ["baseline_cost", "baseline_carbon", "baseline_weighted", "baseline_random", "dro"]:
+        sub = ok[ok["method"] == method]
+        if len(sub) == 0:
+            continue
+        grp = sub.groupby(["I", "J"])["solve_time_s"].mean().reset_index()
+        for I in sorted(grp["I"].unique()):
+            g = grp[grp["I"] == I].sort_values("J")
+            ax.plot(g["J"], g["solve_time_s"], marker="o", label=f"{method}, I={int(I)}")
+
+    ax.set_title(f"Runtime scaling (mean over seeds), tag={tag}")
+    ax.set_xlabel("Number of jobs (J)")
+    ax.set_ylabel("Solve time seconds")
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=2)
+
+    _save(fig, outdir, f"fig_runtime_{tag}.png")
+
+
+def plot_feasibility_rate(df_raw: pd.DataFrame, outdir: str, tag: str = "scaling"):
+    # feasibility rate of dro over seeds
+    df = df_raw[df_raw["method"] == "dro"].copy()
+    if len(df) == 0:
+        return
+
+    df["is_ok"] = df["solve_status"].astype(str).str.startswith("ok").astype(int)
+    grp = df.groupby(["I", "J"])["is_ok"].mean().reset_index()
+
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+
+    for I in sorted(grp["I"].unique()):
+        g = grp[grp["I"] == I].sort_values("J")
+        ax.plot(g["J"], g["is_ok"], marker="o", label=f"I={int(I)}")
+
+    ax.set_title(f"DRO feasibility rate over seeds, tag={tag}")
+    ax.set_xlabel("Number of jobs (J)")
+    ax.set_ylabel("Fraction solved ok")
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    _save(fig, outdir, f"fig_feasibility_{tag}.png")
+
+
+def plot_sensitivity_heatmap(df_sens_raw: pd.DataFrame, outdir: str):
+    # expects a sensitivity run with columns eps and cvar_w
+    df = df_sens_raw.copy()
+    df = df[(df["method"] == "dro") & (df["solve_status"].astype(str).str.startswith("ok"))]
+    if len(df) == 0:
+        return
+
+    # aggregate over seeds
+    grp = df.groupby(["eps", "cvar_w"])["cvar_carbon"].mean().reset_index()
+    pivot = grp.pivot(index="eps", columns="cvar_w", values="cvar_carbon").sort_index()
+
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
+
+    im = ax.imshow(pivot.values, aspect="auto")
+    ax.set_title("Sensitivity heatmap: DRO CVaR 0.9 carbon")
+    ax.set_xlabel("cvar_w")
+    ax.set_ylabel("eps")
+
+    ax.set_xticks(np.arange(len(pivot.columns)))
+    ax.set_xticklabels([f"{v:g}" for v in pivot.columns], rotation=45, ha="right")
+
+    ax.set_yticks(np.arange(len(pivot.index)))
+    ax.set_yticklabels([f"{v:.3f}" for v in pivot.index])
+
+    fig.colorbar(im, ax=ax, label="CVaR 0.9 carbon")
+
+    _save(fig, outdir, "fig_sensitivity_heatmap.png")
